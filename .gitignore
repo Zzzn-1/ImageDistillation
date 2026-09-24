@@ -1,0 +1,48 @@
+# Raw datasets and generated artifacts
+dataset/
+# Prepared input images and masks for ProPainter
+/Input/
+outputs/
+
+# Model weights and checkpoints
+models/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Third-party repositories cloned locally
+third_party/
+
+# Videos, previews, and large media exports
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.gif
+
+# Python caches and local runtime files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local tool caches
+.cache/
+
+# Environment and machine-local config
+.env
+.env.*
+*.log
+*.tmp
+*.swp
+*.swo
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
