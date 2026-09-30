@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Analyze vehicle tracks, then render reviewed YOLO11 + SAM2 removal masks.
+"""Remove all people/cars/buses/trucks and confirmed ridden two-wheelers.
 
-No single-image classifier can establish physical motion or rider identity.
-Automatic decisions are conservative heuristics; inspect tracks before rendering.
+Parked or uncertain bicycles/motorcycles are protected. Riding requires repeated
+person/vehicle geometry and camera-compensated co-motion; stationary riders may
+need manual overrides. Outputs are masks, not inpainted images.
 """
 
 import argparse
@@ -16,7 +17,9 @@ from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 CLASSES = {0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
-DECISION_VERSION = 2
+ALWAYS_REMOVE = frozenset({0, 2, 5, 7})
+TWO_WHEELERS = frozenset({1, 3})
+DECISION_VERSION = 3
 
 
 def class_family(cls):
@@ -62,18 +65,17 @@ def summarize_tracks(tracks, args):
         valid, moving = len(t["valid"]), len(t["moving"])
         riders = {str(pid): len(votes) for pid, votes in t["riders"].items()}
         rider_votes = max(riders.values(), default=0)
-        dynamic = moving >= args.min_votes and moving / max(valid, 1) >= args.moving_ratio
         # Each rider vote ALREADY requires BOTH objects to move together after
         # camera compensation. A whole-track moving ratio must not veto it.
         riding = rider_votes >= args.min_votes
         actions, reasons = {}, {}
         for cls in sorted(t["classes"]):
-            action, reason = "keep", "uncertain_or_no_confirmed_motion"
+            action, reason = "keep", "parked_or_no_confirmed_rider"
             if cls == 0:
                 action, reason = "remove", "person"
-            elif cls in (2, 5, 7) and dynamic:
-                action, reason = "remove", "motion_evidence"
-            elif cls in (1, 3) and riding:
+            elif cls in ALWAYS_REMOVE:
+                action, reason = "remove", "road_vehicle_always_remove"
+            elif cls in TWO_WHEELERS and riding:
                 action, reason = "remove", "rider_geometry_and_comotion"
             actions[str(cls)], reasons[str(cls)] = action, reason
         unique_actions = set(actions.values())
@@ -82,7 +84,7 @@ def summarize_tracks(tracks, args):
         reason = next(iter(unique_reasons)) if len(unique_reasons) == 1 else "per_class_decision"
         decisions[tid] = {"classes": sorted(t["classes"]), "action": action, "reason": reason,
                           "actions_by_class": actions, "reasons_by_class": reasons,
-                          "review": t["classes"] != {0}, "first": t["first"], "last": t["last"],
+                          "review": bool(t["classes"] & TWO_WHEELERS), "first": t["first"], "last": t["last"],
                           "frames": t["frames"], "valid_motion_votes": valid, "moving_votes": moving,
                           "rider_votes": rider_votes, "rider_votes_by_person": riders,
                           "motion_sources": dict(t["motion_sources"]),
@@ -91,9 +93,22 @@ def summarize_tracks(tracks, args):
 
 
 def automatic_action(obj, track):
-    if obj["class"] == 0:
+    if obj["class"] in ALWAYS_REMOVE:
         return "remove"
     return track.get("actions_by_class", {}).get(str(obj["class"]), track["action"])
+
+
+def removal_action(obj, track, overrides, frame_name):
+    """Mandatory classes cannot be kept, even by mixed-track overrides."""
+    if obj["class"] in ALWAYS_REMOVE:
+        return "remove"
+    action = override_action(str(obj["id"]), overrides, frame_name)
+    return action if action is not None else automatic_action(obj, track)
+
+
+def override_action(tid, overrides, frame_name):
+    return overrides.get("frames", {}).get(frame_name, {}).get(tid,
+           overrides.get("tracks", {}).get(tid))
 
 
 def write_json(path, value):
@@ -128,7 +143,8 @@ def parse_args():
     analyze.add_argument("--motion-px", type=float, default=2.5, help="Minimum residual over motion-lag, original pixels")
     analyze.add_argument("--motion-relative", type=float, default=0.02, help="Residual / object box diagonal")
     analyze.add_argument("--min-votes", type=int, default=3, help="Motion/rider votes spaced by at least motion-lag frames")
-    analyze.add_argument("--moving-ratio", type=float, default=0.6)
+    analyze.add_argument("--moving-ratio", type=float, default=0.6,
+                         help="Legacy option, no longer used for removal decisions")
     analyze.add_argument("--overlay-every", type=int, default=10)
     render = sub.add_parser("render", help="SAM2 masks from analyzed tracks and optional decisions")
     render.add_argument("--analysis", type=Path, required=True)
@@ -140,6 +156,21 @@ def parse_args():
     render.add_argument("--dilate", type=int, default=2)
     render.add_argument("--sam-min-score", type=float, default=0.5)
     render.add_argument("--overlay-every", type=int, default=10)
+    render.add_argument("--temporal-hold", type=int, default=5,
+                        help="Continue confirmed two-wheeler removal across ID changes for up to "
+                             "this many frames without fresh evidence; 0 disables (default: 5)")
+    render.add_argument("--temporal-iou", type=float, default=0.5,
+                        help="Minimum flow-warped mask IoU for temporal association (default: 0.5)")
+    render.add_argument("--resume", action="store_true", help="Reuse completed frames with identical settings")
+    render.add_argument("--no-rider-recovery", action="store_true",
+                        help="Disable adjacent-frame rider recovery and duplicate-bike repair")
+    render.add_argument("--no-carried-items", action="store_true", help="Disable carried-object detection")
+    render.add_argument("--carried-yolo", type=Path, default=ROOT / "models/yolo11x-seg.pt")
+    render.add_argument("--carried-conf", type=float, default=0.15)
+    render.add_argument("--carried-world", type=Path,
+                        help="Optional local YOLO-World checkpoint for newspaper/paper text detection")
+    render.add_argument("--carried-prompts", type=Path,
+                        help='Optional JSON {"frame.png":[{"box":[x1,y1,x2,y2],"label":"newspaper"}]}')
     args = parser.parse_args()
     if args.overlay_every < 0:
         parser.error("overlay-every must be nonnegative")
@@ -152,6 +183,12 @@ def parse_args():
             parser.error("motion-px must be positive; motion-relative must be nonnegative")
     elif args.dilate < 0 or not 0 <= args.sam_min_score <= 1:
         parser.error("Invalid dilation or SAM score threshold")
+    elif args.temporal_hold < 0 or not 0 < args.temporal_iou <= 1:
+        parser.error("Require temporal-hold >= 0 and 0 < temporal-iou <= 1")
+    elif not 0 < args.carried_conf <= 1:
+        parser.error("Require 0 < carried-conf <= 1")
+    elif args.no_carried_items and (args.carried_world or args.carried_prompts):
+        parser.error("carried-world/carried-prompts require carried-item detection")
     return args
 
 
@@ -302,7 +339,7 @@ def draw_objects(image, objects, decisions=None):
         color = (0, 0, 255) if decision.get("action") == "remove" else (0, 255, 255)
         x1, y1, x2, y2 = map(int, obj["box"])
         cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 1)
-        label = f'{obj["id"]} {CLASSES[obj["class"]]} {decision.get("action", "")}'
+        label = f'{obj["id"]} {obj.get("label", CLASSES.get(obj["class"], "object"))} {decision.get("action", "")}'
         cv2.putText(canvas, label, (x1, max(12, y1-4)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
     return canvas
 
@@ -423,8 +460,9 @@ def read_overrides(path, tracks, records):
         for tid, action in group.items():
             if tid not in valid or action not in {"keep", "remove"}:
                 raise ValueError(f"Invalid override: {tid}={action}")
-            if tracks[tid]["classes"] == [0] and action == "keep":
-                raise ValueError("All people must be removed; cannot keep a person track")
+            if set(tracks[tid]["classes"]) <= ALWAYS_REMOVE and action == "keep":
+                raise ValueError("All person/car/bus/truck detections must be removed; "
+                                 "keep overrides are only supported for bicycles/motorcycles")
     return data
 
 
@@ -457,10 +495,16 @@ def render(args):
     import torch
     from sam2.build_sam import build_sam2
     from sam2.sam2_image_predictor import SAM2ImagePredictor
+    from dynamic_mask_temporal import TemporalRemoval
+    from dynamic_mask_refinement import RiderRecovery, CarriedItems, remove_duplicate_bikes
+    from dynamic_mask_resume import completed_prefix, frame_counts
 
     summary = json.loads((args.analysis / "summary.json").read_text())
     if not summary.get("complete"):
         raise ValueError("Analysis is incomplete")
+    if summary.get("decision_version") != DECISION_VERSION:
+        raise ValueError("Removal rules changed: rerun analyze with Dynamic03_generate_masks.py "
+                         "into a new directory before rendering")
     tracks = json.loads((args.analysis / "tracks.json").read_text())
     records = [json.loads(line) for line in (args.analysis / "frames.jsonl").read_text().splitlines()]
     if len(records) != summary["frames"]:
@@ -479,17 +523,40 @@ def render(args):
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA unavailable")
         torch.cuda.set_device(device)
-    predictor = SAM2ImagePredictor(build_sam2(args.sam_config, str(args.sam_checkpoint), device=str(device)))
-    fresh_directory(args.output)
-    for name in ("masks", "raw_masks", "colmap_masks", "overlays"):
-        (args.output / name).mkdir()
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
-    config.update(overrides_applied=overrides, temporal_mask_propagation=False)
-    write_json(args.output / "config.json", config)
-    write_json(args.output / "tracks.json", tracks)
+    config.pop("resume", None)
+    config.update(overrides_applied=overrides, temporal_mask_propagation=False,
+                  temporal_decision_propagation=args.temporal_hold > 0,
+                  temporal_decision_version=1, decision_version=DECISION_VERSION, refinement_version=1)
+    if args.carried_prompts:
+        prompts = json.loads(args.carried_prompts.read_text())
+        if set(prompts) - {r["name"] for r in records}:
+            raise ValueError("Carried prompts contain frames outside this analysis")
+        config["carried_prompts_applied"] = prompts
+    completed, append_offset = [], 0
+    if args.resume:
+        completed, append_offset = completed_prefix(args.output, records, config, tracks)
+        print(f'Resuming: {len(completed)}/{len(records)} complete frames. '
+              'Replaying their temporal decisions without YOLO/SAM2 inference.', flush=True)
+    else:
+        fresh_directory(args.output)
+        write_json(args.output / "config.json", config)
+        write_json(args.output / "tracks.json", tracks)
+    for name in ("masks", "raw_masks", "colmap_masks", "overlays"):
+        (args.output / name).mkdir(exist_ok=True)
+    if len(completed) == len(records):
+        counts = sum((frame_counts(entry) for entry in completed), Counter())
+        write_json(args.output / "summary.json", dict(counts))
+        print('All frames are complete.', flush=True)
+        return
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (args.dilate * 2 + 1,) * 2)
     counts = Counter()
-    with torch.inference_mode(), (args.output / "manifest.jsonl").open("w") as manifest:
+    temporal = TemporalRemoval(hold=args.temporal_hold, min_iou=args.temporal_iou)
+    recovery = RiderRecovery(track_points, background_mask) if not args.no_rider_recovery else None
+    predictor, carried = None, None
+    mode = "r+b" if (args.output / "manifest.jsonl").exists() else "w+b"
+    with torch.inference_mode(), (args.output / "manifest.jsonl").open(mode) as manifest:
+        # Delay truncation until input replay succeeds and the first new frame is fully rendered.
         for index, record in enumerate(records):
             image = cv2.imread(record["source"])
             if image is None or list(image.shape[:2]) != record["shape"]:
@@ -503,11 +570,34 @@ def render(args):
             decisions = {}
             for obj in objects:
                 tid = str(obj["id"])
-                action = overrides.get("frames", {}).get(record["name"], {}).get(tid,
-                         overrides.get("tracks", {}).get(tid, automatic_action(obj, tracks[tid])))
-                if obj["class"] == 0:
-                    action = "remove"  # Even when an ID switched between a vehicle and a person.
+                action = removal_action(obj, tracks[tid], overrides, record["name"])
                 decisions[tid] = {"action": action}
+            keep_ids = {str(obj["id"]) for obj in objects
+                        if override_action(str(obj["id"]), overrides, record["name"]) == "keep"}
+            if recovery is not None:
+                recovery.update(image, objects, seeds, decisions, keep_ids, record["index"])
+                remove_duplicate_bikes(objects, seeds, decisions, keep_ids)
+            temporal.update(
+                image, objects, seeds, decisions, keep_ids, record["index"], record["name"])
+            if recovery is not None:
+                remove_duplicate_bikes(objects, seeds, decisions, keep_ids)
+            if index < len(completed):
+                saved = completed[index]
+                if any(saved["decisions"].get(tid, {}).get("action") != d["action"]
+                       for tid, d in decisions.items()):
+                    raise ValueError(f'Temporal replay disagrees at {record["name"]}; use a new output directory')
+                counts.update(frame_counts(saved))
+                if index % 100 == 0 or index == len(completed) - 1:
+                    print(f'Replay {index + 1}/{len(completed)} (no model inference)', flush=True)
+                continue
+            if predictor is None:
+                predictor = SAM2ImagePredictor(build_sam2(args.sam_config, str(args.sam_checkpoint), device=str(device)))
+                if not args.no_carried_items:
+                    carried = CarriedItems(args.carried_yolo, str(device), args.carried_conf,
+                                           args.carried_world, args.carried_prompts)
+                    if not args.carried_world and not args.carried_prompts:
+                        print('Carried items: COCO bags/books enabled. Newspapers have no COCO class; '
+                              'use --carried-world or --carried-prompts for explicit paper detection.', flush=True)
             remove = np.zeros((h, w), dtype=bool)
             protect = np.zeros_like(remove)
             person_seed = np.zeros_like(remove)
@@ -519,6 +609,15 @@ def render(args):
             with autocast:
                 if objects:
                     predictor.set_image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+                if carried is not None:
+                    extras = carried.detect(image, objects, seeds, predictor, record["name"])
+                    if extras:
+                        objects = list(objects) + [o for o, _ in extras]
+                        seeds = np.concatenate([seeds, np.stack([s for _, s in extras])])
+                        for obj, seed in extras:
+                            decisions[str(obj["id"])] = {"action": "remove", "label": obj["label"],
+                                                         "carried_by": obj["carried_by"]}
+                            person_seed |= seed
                 for obj, seed in zip(objects, seeds):
                     negative = []
                     for other, other_seed in zip(objects, seeds):
@@ -530,8 +629,9 @@ def render(args):
                             y, x = np.unravel_index(dist.argmax(), region.shape)
                             negative.append([int(x), int(y)])
                     mask, method = refine(predictor, obj, seed, negative, args.sam_min_score)
+                    if "carried_by" in obj:
+                        mask |= seed  # Preserve the accessory detector's full visible outline.
                     decisions[str(obj["id"])]["segmenter"] = method
-                    counts[method] += 1
                     if decisions[str(obj["id"])]["action"] == "remove":
                         remove |= mask
                     else:
@@ -551,9 +651,14 @@ def render(args):
                 active = removal > 0
                 overlay[active] = (0.5 * overlay[active] + np.array([0, 0, 127.5])).astype(np.uint8)
                 save_image(args.output / "overlays" / name, draw_objects(overlay, objects, decisions))
-            manifest.write(json.dumps({"source": record["source"], "mask": "masks/"+name,
-                                       "decisions": decisions, "masked_fraction": float((removal > 0).mean())}) + "\n")
-            counts["frames"] += 1
+            entry = {"source": record["source"], "mask": "masks/"+name,
+                     "decisions": decisions, "masked_fraction": float((removal > 0).mean())}
+            if index == len(completed):
+                manifest.seek(append_offset)
+                manifest.truncate()
+            manifest.write((json.dumps(entry) + "\n").encode())
+            manifest.flush()
+            counts.update(frame_counts(entry))
             if index % 20 == 0 or index == len(records)-1:
                 print(f'Render {index+1}/{len(records)}: {record["name"]}', flush=True)
     write_json(args.output / "summary.json", dict(counts))

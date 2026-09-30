@@ -14,7 +14,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=ROOT / "outputs/mask111.zip",
                         help="CVAT Segmentation Mask 1.1 export ZIP")
-    parser.add_argument("--images", type=Path, default=ROOT / "Input/Images",
+    parser.add_argument("--images", type=Path, default=ROOT / "PropainterInput/Dynamic03/Images",
                         help="Original images, used to validate sizes and fill empty frames")
     parser.add_argument("--output", type=Path, default=ROOT / "outputs/cvat_corrected_masks",
                         help="New directory for 0/255 grayscale PNG masks")

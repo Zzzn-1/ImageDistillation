@@ -1,11 +1,10 @@
-"""Synthetic regressions; no model weights or dataset images are needed.
-
-These tests were authored but not executed, as requested by the user.
-"""
+"""Synthetic regressions; no model weights or dataset images are needed."""
 
 from collections import Counter, defaultdict
 from pathlib import Path
 import sys
+import json
+import tempfile
 from types import SimpleNamespace
 import unittest
 
@@ -13,7 +12,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-import generate_dynamic_masks as masks
+import Dynamic03_generate_masks as masks
 
 masks.cv2, masks.np = cv2, np
 
@@ -35,17 +34,53 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(decision["actions_by_class"], {"1": "remove", "3": "remove"})
 
     def test_person_near_parked_motorcycle_is_not_enough(self):
-        track = self.track([3], moving=0, rider_votes=0)
-        decision = masks.summarize_tracks({"452": track}, self.args)["452"]
-        self.assertEqual(decision["action"], "keep")
+        for cls in (1, 3):
+            with self.subTest(cls=cls):
+                track = self.track([cls], moving=0, rider_votes=0)
+                decision = masks.summarize_tracks({"452": track}, self.args)["452"]
+                self.assertEqual(decision["action"], "keep")
 
     def test_moving_unoccupied_bicycle_is_not_automatically_removed(self):
         track = self.track([1], moving=12, rider_votes=0)
         self.assertEqual(masks.summarize_tracks({"1": track}, self.args)["1"]["action"], "keep")
 
-    def test_road_vehicle_ratio_is_not_relaxed(self):
-        track = self.track([2, 5, 7], moving=6, rider_votes=5)
-        self.assertEqual(masks.summarize_tracks({"1": track}, self.args)["1"]["action"], "keep")
+    def test_people_and_road_vehicles_removed_without_motion_or_rider(self):
+        for cls in (0, 2, 5, 7):
+            for valid, moving in ((0, 0), (12, 0), (12, 6), (12, 12)):
+                with self.subTest(cls=cls, valid=valid, moving=moving):
+                    track = self.track([cls], valid=valid, moving=moving)
+                    decision = masks.summarize_tracks({"1": track}, self.args)["1"]
+                    self.assertEqual(decision["action"], "remove")
+                    self.assertFalse(decision["review"])
+
+    def test_mixed_car_bicycle_id_keeps_unridden_bicycle(self):
+        decision = masks.summarize_tracks({"1": self.track([2, 1], moving=0)}, self.args)["1"]
+        self.assertEqual(decision["action"], "mixed")
+        self.assertEqual(masks.automatic_action({"class": 2}, decision), "remove")
+        self.assertEqual(masks.automatic_action({"class": 1}, decision), "keep")
+
+    def test_keep_overrides_cannot_retain_mandatory_classes(self):
+        overrides = {"tracks": {"1": "keep"}, "frames": {"a.png": {"1": "keep"}}}
+        for cls in (0, 2, 5, 7):
+            obj = {"class": cls, "id": 1}
+            self.assertEqual(masks.removal_action(obj, {"action": "keep"}, overrides, "a.png"), "remove")
+
+    def test_parked_two_wheeler_frame_override_wins_over_track_removal(self):
+        overrides = {"tracks": {"1": "remove"}, "frames": {"parked.png": {"1": "keep"}}}
+        for cls in (1, 3):
+            obj = {"class": cls, "id": 1}
+            self.assertEqual(masks.removal_action(obj, {"action": "remove"}, overrides, "parked.png"), "keep")
+
+    def test_reject_keep_overrides_for_people_and_road_vehicles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "overrides.json"
+            records = [{"name": "a.png", "objects": [{"id": 1}]}]
+            for cls in (0, 2, 5, 7):
+                for overrides in ({"tracks": {"1": "keep"}},
+                                  {"frames": {"a.png": {"1": "keep"}}}):
+                    path.write_text(json.dumps(overrides))
+                    with self.subTest(cls=cls, overrides=overrides), self.assertRaisesRegex(ValueError, "must be removed"):
+                        masks.read_overrides(path, {"1": {"classes": [cls]}}, records)
 
     def test_mixed_person_vehicle_id_does_not_delete_vehicle_by_person_label(self):
         track = self.track([0, 3], valid=1, moving=1)

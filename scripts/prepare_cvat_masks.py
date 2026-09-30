@@ -9,8 +9,8 @@ from zipfile import ZIP_STORED, ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RANGE = (
-    "1732437398_915816307.png",
-    "1732437401_641455889.png",
+    "1733458896_237117052.png",
+    "1733458932_514494419.png",
 )
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 LABELMAP = "background:0,0,0::\nperson:128,0,0::\n"
@@ -39,9 +39,9 @@ def select_images(directory, first, last):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, default=ROOT / "Input/Images",
+    parser.add_argument("--input", type=Path, default=ROOT / "PropainterInput/Dynamic03/Images",
                         help="Original images directory")
-    parser.add_argument("--masks", type=Path, default=ROOT / "Input/masks",
+    parser.add_argument("--masks", type=Path, default=ROOT / "outputs/dynamic03_masks_refined/masks",
                         help="Binary masks directory (0=background, 255=person)")
     parser.add_argument("--frame-range", nargs=2, metavar=("FIRST", "LAST"),
                         default=DEFAULT_RANGE,

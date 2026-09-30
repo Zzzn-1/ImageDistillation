@@ -1,7 +1,7 @@
 # Raw datasets and generated artifacts
 dataset/
 # Prepared input images and masks for ProPainter
-/Input/
+/PropainterInput/
 outputs/
 
 # Model weights and checkpoints
